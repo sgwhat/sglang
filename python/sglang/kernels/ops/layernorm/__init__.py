@@ -26,6 +26,19 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
     )
 del _mod, _fn, _bk
 
+# Identity hyper-connection kernels (DModel DeepSeek-V4): hy4_ihc's math with a
+# separate post-gate eps and tiled / BF16x3 stage-1 projections.
+for _fn in ("ihc_pre", "ihc_post", "ihc_head"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.layernorm.ihc:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
 # Fused hyper-connection combine / norm kernels for small speculative batches.
 _HC_NORM_KERNELS = [
     ("hc_combine_norm", "hc_combine_norm"),

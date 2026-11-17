@@ -177,6 +177,14 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     late_layer_dp_counts,
 )
+from sglang.srt.models.deepseek_common.identity_mhc import (
+    check_identity_residual_supported,
+    identity_head_and_norm,
+    identity_post,
+    identity_pre,
+    is_identity_residual,
+    load_identity_mhc_config,
+)
 from sglang.srt.models.deepseek_common.moe_transport import (
     OverlappedMoeTransport,
     _tbo_run_moe,
@@ -645,19 +653,21 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
 
 
 def make_hc_mixing_params(
-    hc_mult: int, hidden_size: int
+    hc_mult: int, hidden_size: int, *, identity: bool = False
 ) -> Tuple[
     nn.Parameter, nn.Parameter, nn.Parameter, nn.Parameter, nn.Parameter, nn.Parameter
 ]:
-    mix_hc = (2 + hc_mult) * hc_mult
+    # Identity mHC keeps only the pre/post gates: no comb rows, no comb scale.
+    mix_hc = 2 * hc_mult if identity else (2 + hc_mult) * hc_mult
+    num_scales = 2 if identity else 3
     hc_dim = hc_mult * hidden_size
     return (
         nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32)),
         nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32)),
         nn.Parameter(torch.empty(mix_hc, dtype=torch.float32)),
         nn.Parameter(torch.empty(mix_hc, dtype=torch.float32)),
-        nn.Parameter(torch.empty(3, dtype=torch.float32)),
-        nn.Parameter(torch.empty(3, dtype=torch.float32)),
+        nn.Parameter(torch.empty(num_scales, dtype=torch.float32)),
+        nn.Parameter(torch.empty(num_scales, dtype=torch.float32)),
     )
 
 
@@ -3289,6 +3299,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self.hc_mult = hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
+        self.hc_identity = is_identity_residual(config)
+        if self.hc_identity:
+            check_identity_residual_supported(
+                config, is_cuda=_is_cuda, is_nextn=is_nextn
+            )
         (
             self.hc_attn_fn,
             self.hc_ffn_fn,
@@ -3296,7 +3311,9 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.hc_ffn_base,
             self.hc_attn_scale,
             self.hc_ffn_scale,
-        ) = make_hc_mixing_params(hc_mult, config.hidden_size)
+        ) = make_hc_mixing_params(
+            hc_mult, config.hidden_size, identity=self.hc_identity
+        )
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
@@ -3306,6 +3323,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+        # The fused post+pre kernels implement the Sinkhorn comb only.
+        if self.hc_identity:
+            self.use_fused_mhc_post_pre = False
+        self.ihc_config = load_identity_mhc_config() if self.hc_identity else None
         if _is_hip:
             _hip.init_decoder_layer(self, quant_config)
         self.hc_cfg = mhc.HcConfig(
@@ -3471,6 +3492,19 @@ class DeepseekV4DecoderLayerBase(nn.Module):
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
+        if self.hc_identity:
+            # No comb: hc_post keeps the streams unmixed.
+            y, post, norm_fused = identity_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm=norm,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                config=self.ihc_config,
+            )
+            return y, post, None, norm_fused
 
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
@@ -3626,8 +3660,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor,
         post: torch.Tensor,
-        comb: torch.Tensor,
+        comb: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self.hc_identity:
+            return identity_post(x, residual, post, config=self.ihc_config)
         return mhc.post(self.hc_cfg, x, residual, post, comb)
 
     @functools.cached_property
@@ -4005,6 +4041,9 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
+        self.ihc_config = (
+            load_identity_mhc_config() if is_identity_residual(config) else None
+        )
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
         if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
             (
@@ -4758,11 +4797,24 @@ class DeepseekV4Model(nn.Module):
             hidden_states = mhc_combine(
                 pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
             )
+            hidden_states = self.norm(hidden_states)
+        elif self.ihc_config is not None:
+            hidden_states = identity_head_and_norm(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                norm=self.norm,
+                rms_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+                config=self.ihc_config,
+                head=self.hc_head,
+            )
         else:
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
-        hidden_states = self.norm(hidden_states)
+            hidden_states = self.norm(hidden_states)
 
         # DSpark's model-boundary hook gathers compact tail rows. Other CP
         # outputs are gathered with this rank's full shard layout.
@@ -5414,6 +5466,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         self._mhc_prewarmed_at_load = True
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+        # Identity mHC never runs the Sinkhorn TileLang kernels.
+        if self.model.ihc_config is not None:
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
