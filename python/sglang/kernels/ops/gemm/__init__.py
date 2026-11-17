@@ -375,6 +375,17 @@ register_kernel(
         target="sglang.kernels.ops.gemm.bf16_fp32:_linear_bf16_fp32_cublas",
     )
 )
+# DeepSeek-V4 FP32 router logits on BF16 tensor cores (three BF16 weight parts).
+for _fn in ("fp32_router_linear", "fp32_router_linear_bf16x3"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.dsv4_fp32_router:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        )
+    )
+del _fn
 register_kernel(
     KernelSpec(
         op="gemm.wo_a_bf16_gemv",

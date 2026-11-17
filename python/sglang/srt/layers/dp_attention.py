@@ -1406,12 +1406,14 @@ def get_cuda_graph_batch_size_alignment(
     *,
     gathered_buffer_required: Optional[bool] = None,
     include_cp_alignment: bool = True,
+    include_tbo_alignment: bool = True,
 ) -> int:
-    """Decode may waive CP alignment only when no gathered buffer needs it."""
+    """Decode may waive CP alignment only when no gathered buffer needs it, and
+    TBO alignment when two-batch overlap does not split its batches."""
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
-    if get_exec().overlap.enable_two_batch_overlap:
+    if include_tbo_alignment and get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size

@@ -232,10 +232,28 @@ def _compute_moe_deepseek_v4_prefill(layer):
             layer.op_mhc_postprocess,
         ]
     return OperationsStrategy(
-        deep_gemm_num_sms=None,
+        deep_gemm_num_sms=deepseek_v4_tbo_deep_gemm_num_sms(),
         tbo_delta_stages=0,
         operations=ops,
     )
+
+
+def deepseek_v4_tbo_deep_gemm_num_sms() -> Optional[int]:
+    """DeepGEMM's SM budget during DeepSeek-V4 prefill TBO: what DeepEP's
+    normal-mode kernels leave free for the other micro-batch, or None for all."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if (
+        _is_hip
+        or not envs.SGLANG_OPT_DSV4_TBO_RESERVE_DEEPEP_SMS.get()
+        or not get_moe_a2a_backend().is_deepep()
+    ):
+        return None
+    total_num_sms = torch.cuda.get_device_properties(
+        device="cuda"
+    ).multi_processor_count
+    return total_num_sms - DeepEPConfig.get_instance().num_sms
 
 
 # -------------------------------- Strategy for Qwen3 ---------------------------------------

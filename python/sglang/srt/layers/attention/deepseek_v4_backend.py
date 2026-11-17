@@ -178,6 +178,23 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
 
 
+def _tbo_child_planning_scope(forward_batch: ForwardBatch, logical_forward_mode):
+    """Plan a prefill TBO child's DeepGEMM schedules (the indexer's) under the
+    SM budget its layers run with in DeepseekV4Model._forward_layers_tbo."""
+    if not (
+        _is_cuda
+        and forward_batch.tbo_parent_token_range is not None
+        and logical_forward_mode.is_extend_without_speculative()
+    ):
+        return nullcontext()
+    from sglang.srt.batch_overlap.operations_strategy import (
+        deepseek_v4_tbo_deep_gemm_num_sms,
+    )
+    from sglang.srt.layers.deep_gemm_wrapper import configure_deep_gemm_num_sms
+
+    return configure_deep_gemm_num_sms(deepseek_v4_tbo_deep_gemm_num_sms())
+
+
 def _use_dsv4_cutedsl_h16_forward(
     dsv4_prefill_backend: str, forward_batch: ForwardBatch
 ) -> bool:
@@ -2991,7 +3008,7 @@ class DeepseekV4AttnBackend(
             real_rows_scope(forward_batch, real_num_tokens)
             if real_num_tokens is not None
             else nullcontext()
-        ):
+        ), _tbo_child_planning_scope(forward_batch, logical_forward_mode):
             self.forward_metadata = self._build_forward_metadata(
                 forward_batch, real_num_tokens=real_num_tokens
             )

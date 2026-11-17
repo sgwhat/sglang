@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary import (
     Layout,
@@ -41,6 +42,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
+    get_exec,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import SpecInput
@@ -56,6 +58,22 @@ _is_hip = is_hip()
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
 logger = logging.getLogger(__name__)
+
+
+def tbo_splits_decode() -> bool:
+    """Whether two-batch overlap also splits decode and target-verify batches,
+    and so captures their CUDA graphs split."""
+    return (
+        get_exec().overlap.enable_two_batch_overlap
+        and not envs.SGLANG_OPT_TBO_PREFILL_ONLY.get()
+    )
+
+
+def tbo_keeps_whole(forward_mode: ForwardMode) -> bool:
+    """Whether a batch of this mode runs exactly as without two-batch overlap."""
+    return (
+        forward_mode.is_decode() or forward_mode.is_target_verify()
+    ) and not tbo_splits_decode()
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------
@@ -342,7 +360,7 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if not is_tbo_enabled() or tbo_keeps_whole(batch.forward_mode):
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -433,13 +451,17 @@ class TboDPAttentionPreparer:
                 token_num_per_seq=token_num_per_seq,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
-            local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                (
-                    local_batch.forward_mode.is_extend()
-                    and not local_batch.forward_mode.is_target_verify()
+            local_can_run_tbo = (
+                (self.local_tbo_split_seq_index is not None)
+                and not (
+                    (
+                        local_batch.forward_mode.is_extend()
+                        and not local_batch.forward_mode.is_target_verify()
+                    )
+                    and enable_a2a_moe
+                    and (resolved_deepep_mode.is_low_latency())
                 )
-                and enable_a2a_moe
-                and (resolved_deepep_mode.is_low_latency())
+                and not tbo_keeps_whole(local_batch.forward_mode)
             )
         else:
             self.local_tbo_split_seq_index = 0

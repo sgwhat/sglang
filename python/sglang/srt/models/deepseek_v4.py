@@ -198,6 +198,10 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
+from sglang.srt.models.deepseek_common.wo_a_online_quant import (
+    quantize_bf16_wo_a_streaming,
+    wo_a_online_quant_config,
+)
 from sglang.srt.models.deepseek_v4_dense_ffn import build_dense_mlp, is_dense_ffn_layer
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
@@ -1102,6 +1106,10 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config: Optional[QuantizationConfig] = (
                 quant_config if quantize_wo_a or keep_source_quant else None
             )
+            # The checkpoint may list wo_a as unquantized; load_weights then
+            # quantizes its BF16 weight to these blocks.
+            if fp8 and envs.SGLANG_OPT_FP8_WO_A_ONLINE_QUANT.get():
+                wo_a_quant_config = wo_a_online_quant_config()
         elif wo_a_keeps_quant_config:
             wo_a_quant_config = quant_config
         else:
@@ -4505,6 +4513,7 @@ class DeepseekV4Model(nn.Module):
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_key,
         )
+        from sglang.srt.layers import deep_gemm_wrapper
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
         operations_strategy = OperationsStrategy.init_new_tbo(
@@ -4584,11 +4593,14 @@ class DeepseekV4Model(nn.Module):
                 child._tbo_global_input_ids = gids
 
         try:
-            outputs_arr = execute_overlapped_operations(
-                inputs_arr=inputs_arr,
-                operations_arr=[operations_strategy.operations] * 2,
-                delta_stages=[0, operations_strategy.tbo_delta_stages],
-            )
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                operations_strategy.deep_gemm_num_sms
+            ):
+                outputs_arr = execute_overlapped_operations(
+                    inputs_arr=inputs_arr,
+                    operations_arr=[operations_strategy.operations] * 2,
+                    delta_stages=[0, operations_strategy.tbo_delta_stages],
+                )
 
             return _model_forward_tbo_merge_key(
                 outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
@@ -5356,6 +5368,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             self_attn.refresh_attn_sink_cache()
             layer.refresh_mhc_norm_weight_cache()
+            if not layer.is_dense_ffn:
+                layer.mlp.gate.refresh_weight_bf16x3()
         layers = self.model.layers
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
@@ -5547,6 +5561,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         # weight loader's dtype check.
         if not (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
+        elif self.wo_a_fp8 and envs.SGLANG_OPT_FP8_WO_A_ONLINE_QUANT.get():
+            weights = quantize_bf16_wo_a_streaming(
+                weights, pow2_scale=_FP8_WO_A_UE8M0
+            )
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 

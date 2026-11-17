@@ -572,6 +572,44 @@ class MoEGate(nn.Module):
         self.rocm_router_max_tokens = (
             _hip_moe.router_max_tokens(self, config, is_hash_moe) if _is_hip else -1
         )
+        # Rows from which a V4 FP32 router runs on BF16 tensor cores (None: never).
+        self.fp32_router_tc_min_tokens = (
+            envs.SGLANG_OPT_DSV4_FP32_ROUTER_MIN_TOKENS.get()
+            if is_deepseek_v4
+            and _is_cuda
+            and self.weight.dtype == torch.float32
+            and get_platform().device_sm >= 90
+            and envs.SGLANG_OPT_DSV4_FP32_ROUTER_TENSOR_CORE.get()
+            else None
+        )
+        # [3, E, H] BF16 parts of the FP32 weight; see refresh_weight_bf16x3.
+        self.weight_bf16x3: Optional[torch.Tensor] = None
+
+    def refresh_weight_bf16x3(self) -> None:
+        """Split the loaded FP32 weight for the pre-split tensor-core router."""
+        if not (
+            self.fp32_router_tc_min_tokens is not None
+            and envs.SGLANG_OPT_DSV4_FP32_ROUTER_PRESPLIT.get()
+            and self.weight.is_cuda
+        ):
+            return
+        from sglang.kernels.ops.gemm.dsv4_fp32_router import (
+            split_fp32_weight_bf16x3,
+            supports_fp32_router_bf16x3,
+        )
+
+        if supports_fp32_router_bf16x3(self.weight.shape[1]):
+            self.weight_bf16x3 = split_fp32_weight_bf16x3(self.weight.data)
+
+    def _fp32_router_on_tensor_cores(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self.fp32_router_tc_min_tokens is not None
+            and hidden_states.shape[0] >= self.fp32_router_tc_min_tokens
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.stride(1) == self.weight.stride(1) == 1
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
 
     def forward(
         self,
@@ -580,6 +618,15 @@ class MoEGate(nn.Module):
         forward_batch: ForwardBatch = None,
     ):
         if self.weight.dtype == torch.float32:
+            if self._fp32_router_on_tensor_cores(hidden_states):
+                from sglang.kernels.ops.gemm.dsv4_fp32_router import (
+                    fp32_router_linear,
+                    fp32_router_linear_bf16x3,
+                )
+
+                if self.weight_bf16x3 is not None:
+                    return fp32_router_linear_bf16x3(hidden_states, self.weight_bf16x3)
+                return fp32_router_linear(hidden_states, self.weight)
             return F.linear(hidden_states.float(), self.weight)
 
         if use_intel_amx_backend(self):

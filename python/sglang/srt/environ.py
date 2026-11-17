@@ -2096,6 +2096,20 @@ class Envs:
     # Identity mHC (hc_residual_mode=identity) kernels: "triton" or the "eager"
     # torch reference.
     SGLANG_OPT_IHC_BACKEND = EnvStr("triton")
+    # Triton identity mHC pre: from MIN_TOKENS rows, share each FP32 gate tile
+    # across a block of tokens (TF32x3) instead of one token per CTA.
+    SGLANG_OPT_IHC_PRE_TILED = EnvBool(False)
+    SGLANG_OPT_IHC_PRE_TILED_MIN_TOKENS = EnvInt(1024)
+    # In the tiled pre, feed a BF16 stream to BF16 tensor cores against a
+    # three-way BF16 split of the gate weights instead of TF32x3.
+    SGLANG_OPT_IHC_PRE_BF16X3 = EnvBool(False)
+    # FP32 MoE router (router_fp32) on BF16 tensor cores with a three-way BF16
+    # split of the weight, from MIN_TOKENS rows; SM90+.
+    SGLANG_OPT_DSV4_FP32_ROUTER_TENSOR_CORE = EnvBool(False)
+    SGLANG_OPT_DSV4_FP32_ROUTER_MIN_TOKENS = EnvInt(1024)
+    # With the tensor-core router: split the FP32 weight into its BF16 parts
+    # once at load and run larger tiles with per-512-K compensation.
+    SGLANG_OPT_DSV4_FP32_ROUTER_PRESPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Shard the ratio-1/2 index sources' dense prefill scores across the
     # attention-TP group and all-gather the selections, instead of every rank
@@ -2138,6 +2152,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # With SGLANG_OPT_FP8_WO_A_GEMM: build wo_a as 128x128 block FP8 even when
+    # the checkpoint keeps it unquantized, quantizing a BF16 wo_a at load.
+    SGLANG_OPT_FP8_WO_A_ONLINE_QUANT = EnvBool(False)
     # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
     # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
@@ -2183,6 +2200,12 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    # Prefill two-batch overlap with DeepEP: cap DeepGEMM at the SMs DeepEP's
+    # normal-mode kernels leave free, and plan the children's indexer the same.
+    SGLANG_OPT_DSV4_TBO_RESERVE_DEEPEP_SMS = EnvBool(False)
+    # With --enable-two-batch-overlap, split only extend batches; decode and
+    # target-verify batches (and their CUDA graphs) run exactly as without TBO.
+    SGLANG_OPT_TBO_PREFILL_ONLY = EnvBool(False)
 
     # ===================================================================
     # Inkling

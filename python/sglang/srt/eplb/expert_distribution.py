@@ -439,7 +439,12 @@ class _SinglePassGatherer(ABC):
             # NPU dispatch retains expert IDs for graph-padding rows, so receive
             # counts include padding. Use the separately masked TopK IDs to count
             # valid routes in normal, low-latency, and auto modes.
-            if get_platform().is_npu or get_exec().moe.deepep_mode == "normal":
+            # TopK observes physical expert IDs in both normal and low-latency
+            # forwards of auto mode, including captured graph replays.
+            if get_platform().is_npu or get_exec().moe.deepep_mode in (
+                "normal",
+                "auto",
+            ):
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(

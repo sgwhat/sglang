@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.batch_overlap.two_batch_overlap import tbo_splits_decode
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.cp.cp_decode_attn_tp import can_defer_cp_decode_attn_tp
@@ -97,14 +98,16 @@ def get_batch_sizes_to_capture(
             is_deepseek_dsa(hf_config)
             and getattr(hf_config, "q_lora_rank", None) is not None
         )
+    split_by_tbo = tbo_splits_decode()
     mul_base = get_cuda_graph_batch_size_alignment(
         gathered_buffer_required=gathered_buffer_required,
         include_cp_alignment=not decode_uses_tp_rows,
+        include_tbo_alignment=split_by_tbo,
     )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
-    if get_exec().overlap.enable_two_batch_overlap:
+    if split_by_tbo:
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out

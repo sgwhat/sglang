@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 import torch
 import tqdm
 
+from sglang.srt.batch_overlap.two_batch_overlap import tbo_splits_decode
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
@@ -344,7 +345,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        # Decode and verify graphs are split only when TBO splits their batches.
+        self.enable_two_batch_overlap = tbo_splits_decode()
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph

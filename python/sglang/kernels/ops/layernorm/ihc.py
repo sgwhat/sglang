@@ -389,7 +389,7 @@ def ihc_pre(
     bf16x3: bool = False,
     _has_post: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Collapse ``x [T, hc, H]`` to the sublayer input ``[T, H]``; returns ``(y, post)``.
+    """Collapse ``x [T, hc, H]`` to the sublayer input ``[T, H]``: ``(y, post)``.
 
     ``norm_weight`` folds the following RMSNorm after the readout's rounding to
     ``x.dtype``. Batches of at least ``tiled_min_tokens`` rows (None: never) run

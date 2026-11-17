@@ -115,7 +115,15 @@ def load_identity_mhc_config() -> IdentityMhcConfig:
         raise ValueError(
             f"SGLANG_OPT_IHC_BACKEND must be one of {_BACKENDS}, got {backend!r}"
         )
-    return IdentityMhcConfig(backend=backend)
+    return IdentityMhcConfig(
+        backend=backend,
+        pre_tiled_min_tokens=(
+            envs.SGLANG_OPT_IHC_PRE_TILED_MIN_TOKENS.get()
+            if envs.SGLANG_OPT_IHC_PRE_TILED.get()
+            else None
+        ),
+        pre_bf16x3=envs.SGLANG_OPT_IHC_PRE_BF16X3.get(),
+    )
 
 
 def identity_pre(

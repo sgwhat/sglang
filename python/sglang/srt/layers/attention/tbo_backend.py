@@ -74,7 +74,9 @@ class TboAttnBackend(AttentionBackend):
         self.primary.init_forward_metadata_out_graph(
             forward_batch=forward_batch, in_capture=in_capture
         )
-        if not self._children_use_cuda_graph():
+        if not self._children_use_cuda_graph() or two_batch_overlap.tbo_keeps_whole(
+            forward_batch.forward_mode
+        ):
             return
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
