@@ -70,10 +70,11 @@ def tbo_splits_decode() -> bool:
 
 
 def tbo_keeps_whole(forward_mode: ForwardMode) -> bool:
-    """Whether a batch of this mode runs exactly as without two-batch overlap."""
-    return (
+    """Whether two-batch overlap leaves a batch of this mode unsplit, so it
+    runs exactly as without TBO."""
+    return envs.SGLANG_OPT_TBO_PREFILL_ONLY.get() and (
         forward_mode.is_decode() or forward_mode.is_target_verify()
-    ) and not tbo_splits_decode()
+    )
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------

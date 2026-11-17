@@ -178,6 +178,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.identity_mhc import (
+    IdentityMhcConfig,
     check_identity_residual_supported,
     identity_head_and_norm,
     identity_post,
@@ -3670,7 +3671,8 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         post: torch.Tensor,
         comb: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.hc_identity:
+        # Only an identity hc_pre leaves no comb.
+        if comb is None and self.hc_identity:
             return identity_post(x, residual, post, config=self.ihc_config)
         return mhc.post(self.hc_cfg, x, residual, post, comb)
 
@@ -3955,8 +3957,9 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
-    # Class-level default for instances built without running __init__.
+    # Class-level defaults for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    ihc_config: Optional[IdentityMhcConfig] = None
 
     def __init__(
         self,
