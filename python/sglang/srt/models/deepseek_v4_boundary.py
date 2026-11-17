@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models.deepseek_common.identity_mhc import is_identity_residual
 from sglang.srt.models.deepseek_common.moe_transport import (
     MoeFinalize,
     MoeRowTransport,
@@ -425,9 +426,11 @@ def stages(config, layer_id, *, layer=None):
         from sglang.srt.models.deepseek_v4 import _is_fused_mhc_post_pre_enabled_xpu
 
         lagged = config.hc_pre_from_prev_sublayer
+        # As DeepseekV4DecoderLayerBase decides use_fused_mhc_post_pre: the
+        # fused post+pre kernels implement the Sinkhorn comb only.
         fused = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
-        )
+        ) and not is_identity_residual(config)
     else:
         lagged = layer.boundary_pre_from_prev
         fused = layer.boundary_mhc_fusions and layer.use_fused_mhc_post_pre

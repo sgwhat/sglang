@@ -30,6 +30,7 @@ class TestPipelineCompletion(unittest.TestCase):
                     config = SimpleNamespace(
                         hc_pre_from_prev_sublayer=lagged,
                         model_type="deepseek_v41" if lagged else "deepseek_v4",
+                        hc_residual_mode="sinkhorn",
                         n_dense_layers=0,
                     )
                     layer = SimpleNamespace(

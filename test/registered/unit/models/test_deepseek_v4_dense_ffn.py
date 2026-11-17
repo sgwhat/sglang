@@ -89,7 +89,11 @@ class TestDenseFfnLayouts(CustomTestCase):
     def test_stage_facts_declare_dense_layers_without_moe_transport(self):
         """Dense layers declare no operand transport, and the last of them marks
         where a TBO split meets the first sparse layer."""
-        config = SimpleNamespace(hc_pre_from_prev_sublayer=False, n_dense_layers=3)
+        config = SimpleNamespace(
+            hc_pre_from_prev_sublayer=False,
+            hc_residual_mode="sinkhorn",
+            n_dense_layers=3,
+        )
         parallel = _parallel(attn_dp=8, attn_tp=1)
         with (
             patch.object(boundary, "get_moe_a2a_backend", return_value=_a2a(False)),
@@ -99,7 +103,10 @@ class TestDenseFfnLayouts(CustomTestCase):
                 return_value=parallel,
             ),
         ):
-            ffn = {layer_id: boundary.stages(config, layer_id)[1] for layer_id in (1, 2, 3)}
+            ffn = {
+                layer_id: boundary.stages(config, layer_id)[1]
+                for layer_id in (1, 2, 3)
+            }
         for layer_id in (1, 2):
             with self.subTest(layer_id=layer_id):
                 self.assertFalse(ffn[layer_id].sparse)
