@@ -446,6 +446,29 @@ def stages(config, layer_id, *, layer=None):
     # TBO keeps source rows until expert dispatch, including an uneven final
     # microbatch. It does not shard these rows across attention TP.
     overlapped_ffn[BatchVariant.UNPADDED] = overlapped_ffn[BatchVariant.ORDINARY]
+    ffn_read = HcRead(layer, False) if layer is not None else read
+    dense = (
+        layer.is_dense_ffn if layer is not None else layer_id < config.n_dense_layers
+    )
+    if dense:
+        # No operand transport: the boundary itself moves and sums dense rows.
+        ffn = declare_ffn(
+            sparse=False,
+            read=ffn_read,
+            update=fu,
+            next_layer_sparse=layer_id + 1 >= config.n_dense_layers,
+        )
+    else:
+        ffn = declare_ffn(
+            sparse=True,
+            read=ffn_read,
+            update=fu,
+            row_transport=RowTransport(
+                table_ffn,
+                layer._bind_moe_transport if layer is not None else None,
+                overlapped_rows=overlapped_ffn,
+            ),
+        )
     return (
         declare_attn(
             read=read,
@@ -456,16 +479,7 @@ def stages(config, layer_id, *, layer=None):
                 layer._bind_attention_transport if layer is not None else None,
             ),
         ),
-        declare_ffn(
-            sparse=True,
-            read=HcRead(layer, False) if layer is not None else read,
-            update=fu,
-            row_transport=RowTransport(
-                table_ffn,
-                layer._bind_moe_transport if layer is not None else None,
-                overlapped_rows=overlapped_ffn,
-            ),
-        ),
+        ffn,
     )
 
 

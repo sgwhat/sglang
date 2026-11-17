@@ -190,6 +190,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
+from sglang.srt.models.deepseek_v4_dense_ffn import build_dense_mlp, is_dense_ffn_layer
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
@@ -3256,19 +3257,25 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             )
             else None
         )
-        self.mlp = deepseek_v2.DeepseekV2MoE(
-            config=config,
-            quant_config=moe_quant_config_override or quant_config,
-            prefix=add_prefix("mlp", prefix),
-            layer_id=self.layer_id,
-            alt_stream=moe_alt_stream,
-            routed_quant_stream=moe_routed_quant_stream,
-            is_nextn=is_nextn,
-            is_deepseek_v4=True,
-            vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0
-            and not getattr(config, "language_model_only", False),
-        )
+        self.is_dense_ffn = is_dense_ffn_layer(config, layer_id, is_nextn=is_nextn)
+        if self.is_dense_ffn:
+            self.mlp = build_dense_mlp(
+                config, quant_config, add_prefix("mlp", prefix), is_cuda=_is_cuda
+            )
+        else:
+            self.mlp = deepseek_v2.DeepseekV2MoE(
+                config=config,
+                quant_config=moe_quant_config_override or quant_config,
+                prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
+                alt_stream=moe_alt_stream,
+                routed_quant_stream=moe_routed_quant_stream,
+                is_nextn=is_nextn,
+                is_deepseek_v4=True,
+                vl_correction_bias=config.model_type == "deepseek_v41"
+                and config.vision_n_layers > 0
+                and not getattr(config, "language_model_only", False),
+            )
 
         if _use_aiter:
             # V4.1 runs its FP4 routed experts on MXFP8 activations
@@ -3701,7 +3708,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.self_attn.wo_b.reduce_results = False
-        self.mlp.reduce_results = False
+        if not self.is_dense_ffn:
+            self.mlp.reduce_results = False
         declarations = hc_boundary.stages(self.config, self.layer_id, layer=self)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declarations[0], self.input_layernorm),
@@ -3760,6 +3768,10 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = self.ffn_boundary.prepare(
             hidden_states, forward_batch, read_context=call
         )
+        if self.is_dense_ffn:
+            with self.ffn_boundary.exit(forward_batch) as output:
+                hidden_states = self.mlp(hidden_states, forward_batch)
+            return output.finish(hidden_states)
         transport = self.ffn_boundary.transport_context(forward_batch)
         with self.ffn_boundary.exit(forward_batch) as output:
             hidden_states = self.mlp(
@@ -3811,7 +3823,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         )
         state.hidden_states_after_input_norm = hidden_states
         state.attn_x_quant = residual_batch.written_residual(forward_batch).quantized
-        if get_moe_a2a_backend().is_mori():
+        # mori's op_output reads num_tokens; a dense layer runs no MoE ops.
+        if get_moe_a2a_backend().is_mori() and not self.is_dense_ffn:
             state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(
@@ -3854,6 +3867,11 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         )
         state.clear(expect_keys={"positions", "forward_batch", "tbo_subbatch_index"})
         return output
+
+    def op_dense_mlp(self, state):
+        state.hidden_states_mlp_output = self.mlp(
+            state.pop("hidden_states_mlp_input"), state.forward_batch
+        )
 
     def op_gather_a(self, state):
         state.pop("hidden_states_mlp_input")

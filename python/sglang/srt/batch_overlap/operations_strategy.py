@@ -186,7 +186,17 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 def _compute_moe_deepseek_v4_prefill(layer):
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
-    if get_moe_a2a_backend().is_none():
+    if layer.is_dense_ffn:
+        # A dense FFN has no dispatch or combine to hide; the boundary owns
+        # any sum it leaves, so the layer joins its neighbours without a yield.
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_dense_mlp,
+            layer.op_mhc_postprocess,
+        ]
+    elif get_moe_a2a_backend().is_none():
         # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv
         # (combine) with the other ubatch's attn+MoE compute (ATOM's DSV4 path).
         ops = [
