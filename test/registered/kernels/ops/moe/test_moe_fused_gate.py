@@ -45,6 +45,8 @@ def _reference_gate(
     """Definition-based eager reference for the fused-gate semantics."""
     if scoring_func == "sigmoid":
         activated = scores.sigmoid()
+    elif scoring_func == "softmax_noaux":
+        activated = scores.softmax(dim=-1)
     else:
         activated = torch.nn.functional.softplus(scores).sqrt()
 
@@ -106,6 +108,9 @@ _REFERENCE_CASES = get_ci_test_range(
         (1024, 512, 8, "sqrtsoftplus", 1, True, True),
         (7, 512, 4, "sigmoid", 1, True, False),
         (256, 256, 8, "sqrtsoftplus", 0, False, True),
+        (1, 256, 6, "softmax_noaux", 0, True, True),
+        (64, 128, 4, "softmax_noaux", 1, False, False),
+        (1024, 256, 6, "softmax_noaux", 0, True, False),
     ],
     [
         (1, 128, 4, "sigmoid", 0, True, True),
@@ -114,6 +119,7 @@ _REFERENCE_CASES = get_ci_test_range(
         (256, 384, 6, "sqrtsoftplus", 0, True, False),
         (1024, 128, 4, "sigmoid", 1, False, False),
         (1024, 512, 8, "sqrtsoftplus", 1, True, True),
+        (1024, 256, 6, "softmax_noaux", 0, True, False),
     ],
 )
 
@@ -596,6 +602,94 @@ def test_moe_fused_gate_accepts_non_fp32_bias(
         _scatter_by_expert(fp32_w, fp32_i, num_experts),
         rtol=0,
         atol=0,
+    )
+
+
+def _reference_softmax_noaux(
+    logits: torch.Tensor, bias: torch.Tensor, topk: int, routed_scaling_factor: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Softmax probabilities plus the noaux_tc bias pick the experts; the
+    bias-free probabilities of the picked experts, renormalized and scaled, are
+    the weights."""
+    probs = logits.float().softmax(dim=-1)
+    ids = torch.topk(probs + bias.float().unsqueeze(0), topk, dim=-1).indices
+    weights = probs.gather(1, ids)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    return weights * routed_scaling_factor, ids.to(torch.int32)
+
+
+def test_softmax_noaux_bias_ranks_but_does_not_weight() -> None:
+    """The noaux bias changes which experts win, never their weights; plain
+    softmax folds the bias into the probabilities instead."""
+    num_experts, topk = 256, 6
+    torch.manual_seed(0)
+    logits = torch.randn(4, num_experts, dtype=torch.float32, device=DEVICE)
+    logits[:, 0] = -20.0  # expert 0 has a vanishing probability
+    bias = torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+    bias[0] = 1.0  # ...but its bias outranks every probability
+
+    w, i = moe_fused_gate(
+        logits, bias, topk=topk, scoring_func="softmax_noaux", renormalize=False
+    )
+    probs = logits.softmax(dim=-1)
+    torch.cuda.synchronize()
+
+    assert (i == 0).any(dim=1).all()
+    torch.testing.assert_close(w, probs.gather(1, i.long()), rtol=1e-5, atol=1e-7)
+    weight_of_0 = (w * (i == 0)).sum(dim=1)
+    assert (weight_of_0 < 1e-6).all()
+
+    soft_w, soft_i = moe_fused_gate(
+        logits, bias, topk=topk, scoring_func="softmax", renormalize=False
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(
+        _scatter_by_expert(soft_w, soft_i, num_experts),
+        _scatter_by_expert(w, i, num_experts),
+    )
+
+
+def test_softmax_noaux_select_experts_keeps_the_bias() -> None:
+    """select_experts' GPU route for a softmax router with a correction bias
+    must rank on prob + bias, as the torch-native route does; the plain softmax
+    route used to drop the bias."""
+    from sglang.srt.layers.moe.topk import (
+        TopKConfig,
+        fused_topk_torch_native,
+        select_experts,
+    )
+
+    M, num_experts, topk, scale = 64, 256, 6, 1.5
+    torch.manual_seed(1)
+    logits = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    # Correction biases are on the scale of the probabilities they shift.
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.01
+    hidden = torch.randn(M, 16, dtype=torch.bfloat16, device=DEVICE)
+
+    config = TopKConfig(
+        top_k=topk,
+        renormalize=True,
+        correction_bias=bias,
+        scoring_func="softmax_noaux",
+        routed_scaling_factor=scale,
+        apply_routed_scaling_factor_on_output=True,
+    )
+    output = select_experts(hidden, logits, config)
+    native_w, native_i = fused_topk_torch_native(
+        hidden, logits, topk, True, bias, "softmax_noaux"
+    )
+    ref_w, ref_i = _reference_softmax_noaux(logits, bias, topk, scale)
+    torch.cuda.synchronize()
+
+    dense = _scatter_by_expert(output.topk_weights, output.topk_ids, num_experts)
+    torch.testing.assert_close(
+        dense, _scatter_by_expert(ref_w, ref_i, num_experts), rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        dense,
+        _scatter_by_expert(native_w * scale, native_i, num_experts),
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 

@@ -181,6 +181,8 @@ class TestStageLifecycle(unittest.TestCase):
             hc_sinkhorn_iters=20,
             hc_eps=1e-6,
             rms_norm_eps=1e-6,
+            hc_residual_mode="sinkhorn",
+            n_dense_layers=0,
         )
         attention = SimpleNamespace(
             wo_b=SimpleNamespace(reduce_results=True),
