@@ -123,5 +123,58 @@ class TestDenseFfnLayouts(CustomTestCase):
         self.assertFalse(dense_ffn.is_dense_ffn_layer(config, 0, is_nextn=True))
 
 
+class TestDenseFfnTpSizeResolution(CustomTestCase):
+    def _resolve(self, *, n_dense_layers=3, **overrides):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        args = SimpleNamespace(
+            tp_size=8,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            enable_prefill_cp=False,
+            moe_a2a_backend="none",
+            moe_dense_tp_size=None,
+            enable_waterfill=False,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        model_cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                n_dense_layers=n_dense_layers,
+            )
+        )
+        with patch.object(deepseek_v4_hook, "model_config_of", return_value=model_cfg):
+            deepseek_v4_hook._resolve_dense_ffn_tp_size(args, "DeepseekV4ForCausalLM")
+        return resolving_view(args).moe_dense_tp_size
+
+    def test_auto_sets_moe_dense_tp_size_for_dp_or_a2a_with_attn_tp1(self):
+        self.assertEqual(self._resolve(attn_dp_size=8), 1)
+        self.assertEqual(
+            self._resolve(attn_dp_size=8, moe_a2a_backend="megamoe"),
+            1,
+        )
+        self.assertEqual(
+            self._resolve(attn_dp_size=8, moe_a2a_backend="deepep"),
+            1,
+        )
+        self.assertEqual(
+            self._resolve(tp_size=1, attn_dp_size=1, moe_a2a_backend="deepep"),
+            1,
+        )
+
+    def test_leaves_tp_sharded_and_stock_v4_unchanged(self):
+        self.assertIsNone(self._resolve())
+        self.assertIsNone(self._resolve(n_dense_layers=0, attn_dp_size=8))
+        # attn_tp_size == 4 > 1 cannot use replicated dense FFNs; leave None so
+        # build_dense_mlp reports the unsupported hybrid layout.
+        self.assertIsNone(
+            self._resolve(tp_size=8, attn_dp_size=2, moe_a2a_backend="deepep")
+        )
+        # Explicit user value is preserved.
+        self.assertEqual(self._resolve(attn_dp_size=8, moe_dense_tp_size=8), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

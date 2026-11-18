@@ -200,7 +200,9 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_common.wo_a_online_quant import (
+    is_wo_a_skipped_in_quant_config,
     quantize_bf16_wo_a_streaming,
+    validate_uniform_wo_a_quant_config,
     wo_a_online_quant_config,
 )
 from sglang.srt.models.deepseek_v4_dense_ffn import build_dense_mlp, is_dense_ffn_layer
@@ -305,16 +307,28 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
-def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+def wo_a_fp8_gemm_enabled(
+    quant_config: Optional[QuantizationConfig],
+    wo_a_prefix: str = "model.layers.0.self_attn.wo_a",
+) -> bool:
     """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
     block scales, and on ROCm V4.1's 32x32 where _hip allows it; any other layout
-    dequantizes wo_a to bf16 at load."""
+    (including checkpoints that skip wo_a in ignored_layers without online quant)
+    runs wo_a in bf16."""
     if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
         return False
     block = quant_config.weight_block_size
-    return block == [128, 128] or (
-        block == [32, 32] and _is_hip and _hip.wo_a_fp8_block32_enabled()
-    )
+    if not (
+        block == [128, 128]
+        or (block == [32, 32] and _is_hip and _hip.wo_a_fp8_block32_enabled())
+    ):
+        return False
+    if (
+        not envs.SGLANG_OPT_FP8_WO_A_ONLINE_QUANT.get()
+        and is_wo_a_skipped_in_quant_config(quant_config, wo_a_prefix)
+    ):
+        return False
+    return True
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -1086,8 +1100,11 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        wo_a_prefix = add_prefix("wo_a", prefix)
         fp8: bool = (
-            wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
+            wo_a_fp8_gemm_enabled(quant_config, wo_a_prefix)
+            if wo_a_fp8 is None
+            else wo_a_fp8
         )
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
@@ -4914,7 +4931,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        model_prefix = add_prefix("model", prefix)
+        validate_uniform_wo_a_quant_config(
+            quant_config, config.num_hidden_layers, model_prefix=model_prefix
+        )
+        self.wo_a_fp8 = wo_a_fp8_gemm_enabled(
+            quant_config, f"{model_prefix}.layers.0.self_attn.wo_a"
+        )
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
@@ -6002,7 +6025,7 @@ def _dequant_fp8_wo_a_streaming(
     emitted = False
 
     for name, tensor in weights:
-        if name.endswith(".wo_a.weight"):
+        if name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn:
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
             scale = bucket.pop("scale", None)

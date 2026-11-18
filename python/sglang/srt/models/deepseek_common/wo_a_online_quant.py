@@ -6,15 +6,61 @@ block-FP8 weight. A checkpoint that keeps ``wo_a`` unquantized gets one from
 """
 
 import logging
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 logger = logging.getLogger(__name__)
 
 _BLOCK = 128
+
+
+def is_wo_a_skipped_in_quant_config(
+    quant_config: Optional[QuantizationConfig],
+    wo_a_prefix: str = "model.layers.0.self_attn.wo_a",
+) -> bool:
+    """Whether ``quant_config`` leaves ``wo_a`` unquantized via ``ignored_layers``."""
+    if not isinstance(quant_config, Fp8Config) or not quant_config.ignored_layers:
+        return False
+    return is_layer_skipped(
+        wo_a_prefix,
+        quant_config.ignored_layers,
+        fused_mapping=quant_config.packed_modules_mapping,
+    )
+
+
+def validate_uniform_wo_a_quant_config(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+    *,
+    model_prefix: str = "model",
+) -> None:
+    """``DeepseekV4ForCausalLM`` tracks a single model-wide ``wo_a_fp8`` flag across
+    weight loading and post-load scale setup, so mixed per-layer ``wo_a`` skipping is
+    unsupported unless online quantization normalizes every BF16 ``wo_a`` to FP8."""
+    if (
+        not isinstance(quant_config, Fp8Config)
+        or not quant_config.ignored_layers
+        or num_hidden_layers <= 1
+        or envs.SGLANG_OPT_FP8_WO_A_ONLINE_QUANT.get()
+    ):
+        return
+    skipped = [
+        is_wo_a_skipped_in_quant_config(
+            quant_config, f"{model_prefix}.layers.{i}.self_attn.wo_a"
+        )
+        for i in range(num_hidden_layers)
+    ]
+    if any(skipped) and not all(skipped):
+        raise ValueError(
+            "DeepSeek V4 requires self_attn.wo_a quantization to be uniform across "
+            "all decoder layers unless SGLANG_OPT_FP8_WO_A_ONLINE_QUANT=1."
+        )
 
 
 def wo_a_online_quant_config() -> Fp8Config:

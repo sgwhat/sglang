@@ -268,7 +268,12 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
-        self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        nextn_wo_a_prefix = (
+            "mtp.0.self_attn.wo_a"
+            if isinstance(quant_config, ModelSlimConfig)
+            else add_prefix("model.decoder.self_attn.wo_a", prefix)
+        )
+        self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config, nextn_wo_a_prefix)
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 

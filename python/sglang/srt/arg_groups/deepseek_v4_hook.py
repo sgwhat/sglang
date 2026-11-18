@@ -142,6 +142,46 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
 
+def _resolve_dense_ffn_tp_size(server_args: ServerArgs, model_arch: str) -> None:
+    """Dense FFN layers (``n_dense_layers > 0``) must run replicated per rank when
+    attention DP or a MoE all-to-all backend keeps each rank on its own rows."""
+    cfg = resolving_view(server_args)
+    if (
+        cfg.moe_dense_tp_size is not None
+        or cfg.enable_prefill_cp
+        or cfg.attn_cp_size != 1
+    ):
+        return
+    hf_config = model_config_of(server_args).hf_config
+    n_dense_layers = getattr(hf_config, "n_dense_layers", 0)
+    if n_dense_layers <= 0:
+        return
+    if not (
+        cfg.attn_dp_size > 1
+        or cfg.moe_a2a_backend != "none"
+        or getattr(cfg, "enable_waterfill", False)
+    ):
+        return
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if attn_tp_size != 1:
+        return
+    declare_resolution(
+        server_args,
+        "_resolve_dense_ffn_tp_size",
+        moe_dense_tp_size=1,
+    )
+    logger.info(
+        "Setting moe_dense_tp_size=1 for %s (n_dense_layers=%d) under "
+        "attention DP / MoE A2A with attention TP 1.",
+        model_arch,
+        n_dense_layers,
+    )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -164,6 +204,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
     _resolve_engram_config(server_args)
+    _resolve_dense_ffn_tp_size(server_args, model_arch)
 
     if cfg.dsv4_attn_backend == "auto":
         declare_resolution(
